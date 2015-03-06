@@ -1,0 +1,155 @@
+#!/usr/bin/env ruby
+#
+# s3-download-urls - Print out auto-expiring download urls
+#
+# Usage: s3-download-urls [opts] source
+#
+# Source should be a s3 url that looks like s3://bucket/key
+#
+# The env variables AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# must be set.
+#
+# Chris Dean
+
+require 'fileutils'
+require 'optparse'
+require 'aws-sdk'
+require 'set'
+require 'uri'
+
+DEFAULT_EXPIRES_SECS = 7 * 24 * 60 * 60 # 1 week
+
+class App
+  VERSION = "1.0.0"
+
+  attr_accessor :s3_bucket_name, :s3_key_name, :bucket
+  attr_accessor :options, :expires_in
+
+  def initialize(args)
+    @expires_in = DEFAULT_EXPIRES_SECS
+
+    parse(args)
+
+    s3 = Aws::S3::Resource.new
+    @bucket = s3.bucket(@s3_bucket_name)
+  end
+
+  def make_opts
+    @options = {}
+
+    OptionParser.new do |opts|
+      opts.banner = "s3-downlaod-urls [options] s3://bucket/key"
+      opts.on("-r", "--recursive", "Recursively walk directory tree") do |x|
+        @options[:recursive] = true
+      end
+
+      opts.on("-v", "--version", "Print the version number and exit") do
+        @options[:version] = true
+      end
+
+      opts.on("-c", "--curl", "Print a curl download line") do
+        @options[:show_curl] = true
+      end
+
+      opts.on("--expires SECS",
+              "Change the URL expiration time (default: 1 week)") do |secs|
+        @expires_in = secs
+      end
+
+      opts.on("--access KEY", "AWS access key id") do |key|
+        @aws_access = key
+      end
+
+      opts.on("--secret KEY", "AWS secret key") do |key|
+        @aws_secret = key
+      end
+
+      opts.on("--region REGION", "AWS region") do |r|
+        @aws_region = r
+      end
+    end
+  end
+
+  def parse(args)
+    opts = make_opts
+    opts.parse!(args)
+
+    if @options[:version]
+      puts "Version #{VERSION}"
+      exit
+    end
+
+    ENV["AWS_REGION"] ||= "us-east-1"
+
+    ENV["AWS_ACCESS_KEY_ID"]     = @aws_access if @aws_access
+    ENV["AWS_SECRET_ACCESS_KEY"] = @aws_secret if @aws_secret
+    ENV["AWS_REGION"]            = @aws_region if @aws_region
+
+    @s3_bucket_name, @s3_key_name = s3_url_extract(args.shift)
+
+    unless @s3_key_name
+      puts opts
+      exit 1
+    end
+  end
+
+  def s3_url_extract(url)
+    return nil unless url
+    m = url.match(%r{^s3://([^/]+)/((.*))?})
+    return nil unless m
+    bucket, key = [m[1], m[2]]
+    key ||= "/"
+    [bucket, key]
+  end
+
+  def get_temp_url(key)
+    obj = bucket.object(key)
+    url = obj.presigned_url(:get, expires_in: expires_in)
+    fail "Can't get url" unless url
+    u = URI.parse url
+    # Force http to prevent cert errors
+    u.scheme = "http"
+    u.port = nil
+    u.to_s
+  end
+
+  def print_one(s3_src)
+    url = get_temp_url(s3_src)
+    if options[:show_curl]
+      puts "curl --create-dirs -o '#{s3_src}' '#{url}'"
+    else
+      puts url
+    end
+
+  end
+
+  def run_one
+    print_one(s3_key_name)
+  end
+
+  def run_recursive
+    bucket.objects(prefix: s3_key_name).each do |summary|
+      begin
+        print_one(summary.key)
+      rescue Exception => e
+        if e.instance_of?(SystemExit)
+          raise
+        else
+          abort "s3-download-url: #{e.message}"
+        end
+      end
+    end
+
+  end
+
+  def run
+    if options[:recursive]
+      run_recursive
+    else
+      run_one
+    end
+  end
+
+end
+
+App.new(ARGV).run
